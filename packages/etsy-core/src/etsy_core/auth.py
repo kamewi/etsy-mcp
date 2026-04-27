@@ -9,7 +9,7 @@ This module implements the full OAuth flow:
 
 Critical security properties:
 - Token storage at ~/.config/etsy-mcp/tokens.json (mode 0600, parent 0700)
-- File lock via fcntl.flock() prevents concurrent refresh races
+- File lock via filelock.FileLock prevents concurrent refresh races (cross-platform)
 - Atomic write via tempfile + rename survives crashes mid-refresh
 - refresh_token rotates on every refresh (Etsy requirement)
 - invalid_grant is terminal — never auto-retry, prompt re-login
@@ -18,7 +18,6 @@ Critical security properties:
 
 from __future__ import annotations
 
-import fcntl
 import json
 import logging
 import os
@@ -29,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from filelock import FileLock
 
 from etsy_core.exceptions import EtsyAuthError
 from etsy_core.pkce import CODE_CHALLENGE_METHOD, generate_pkce_pair, generate_state
@@ -376,7 +376,7 @@ class EtsyAuth:
         new refresh_token, then atomically write the new state to disk.
 
         File locking via _refresh_with_lock serializes concurrent refreshes
-        across async tasks and (via fcntl) across concurrent MCP processes.
+        across async tasks and (via filelock) across concurrent MCP processes.
         """
         tokens = current or self._tokens or self.load_tokens()
         if tokens is None or not tokens.refresh_token:
@@ -416,45 +416,41 @@ class EtsyAuth:
         lock_path = self.token_path.with_suffix(".lock")
         lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
 
-        with open(lock_path, "w") as lock_file:
+        with FileLock(str(lock_path)):
             try:
                 os.chmod(lock_path, 0o600)
             except OSError as exc:
                 logger.warning(
                     "Could not set 0600 on lock file %s: %s", lock_path, exc
                 )
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-            try:
-                # Step 1: authoritative re-read from disk
-                disk_tokens = self.load_tokens()
+            # Step 1: authoritative re-read from disk
+            disk_tokens = self.load_tokens()
 
-                # Step 2: another refresher may have already done the work
-                if (
-                    disk_tokens is not None
-                    and disk_tokens.refresh_token
-                    and disk_tokens.access_token
-                    and not disk_tokens.is_expired
-                ):
-                    logger.debug(
-                        "Another refresher already rotated tokens; adopting on-disk state"
-                    )
-                    return disk_tokens
+            # Step 2: another refresher may have already done the work
+            if (
+                disk_tokens is not None
+                and disk_tokens.refresh_token
+                and disk_tokens.access_token
+                and not disk_tokens.is_expired
+            ):
+                logger.debug(
+                    "Another refresher already rotated tokens; adopting on-disk state"
+                )
+                return disk_tokens
 
-                # Step 3: use disk tokens as input if available (authoritative),
-                # otherwise fall back to the caller's argument (bootstrap case).
-                refresh_input = disk_tokens if (
-                    disk_tokens is not None and disk_tokens.refresh_token
-                ) else tokens
+            # Step 3: use disk tokens as input if available (authoritative),
+            # otherwise fall back to the caller's argument (bootstrap case).
+            refresh_input = disk_tokens if (
+                disk_tokens is not None and disk_tokens.refresh_token
+            ) else tokens
 
-                if refresh_input is None or not refresh_input.refresh_token:
-                    raise EtsyAuthError(
-                        "No refresh token available inside refresh lock. "
-                        "Run `etsy-mcp auth login` to re-authenticate."
-                    )
+            if refresh_input is None or not refresh_input.refresh_token:
+                raise EtsyAuthError(
+                    "No refresh token available inside refresh lock. "
+                    "Run `etsy-mcp auth login` to re-authenticate."
+                )
 
-                return await self._refresh_unlocked(refresh_input)
-            finally:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            return await self._refresh_unlocked(refresh_input)
 
     async def _refresh_unlocked(self, tokens: Tokens) -> Tokens:
         """Perform the refresh API call without lock management."""
