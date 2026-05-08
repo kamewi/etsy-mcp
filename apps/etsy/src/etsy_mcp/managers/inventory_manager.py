@@ -11,12 +11,17 @@ The 6-tuple identity key (sku, property_values_sorted, quantity, price, is_enabl
 offering_id) prevents collapsing distinct offerings that happen to share some
 fields. Critical for variation-heavy listings (e.g. MX/SRV-style multi-axis).
 
+GET-vs-PUT schema asymmetry: the GET response includes read-only fields
+(product_id, offering_id, is_deleted) and `price` as a Money dict. The PUT
+body must NOT include those read-only fields, and `price` must be a float.
+We strip + convert before sending. Etsy rejects the request otherwise with
+"Validation error: Array contains invalid keys: product_id,is_deleted".
+
 Managers return raw Etsy response dicts. Tool layer handles envelopes.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any
 
@@ -26,16 +31,24 @@ logger = logging.getLogger(__name__)
 
 
 def _offering_identity_key(offering: dict[str, Any]) -> tuple:
-    """Build a 6-tuple identity for an offering used to detect duplicates during merge.
+    """Build a STABLE identity for an offering — must not change when the
+    caller patches mutable fields like quantity or price.
 
-    Components (in order):
-    - sku (str | None)
-    - property_values_sorted (tuple of (property_id, value_id) sorted)
-    - quantity (int | None)
-    - price (str — Etsy returns Money object; we serialize to str for hashing)
-    - is_enabled (bool | None)
-    - offering_id (int | None) — last to allow None to collapse with future writes
+    Identity rules:
+    - If `offering_id` (or its alias `product_offering_id`) is present, use
+      it. That's Etsy's canonical identifier and never changes.
+    - Otherwise (new offering being created), fall back to (sku, property_values).
+      That uniquely identifies a variation row within a product.
+
+    Earlier versions of this function included quantity, price, and is_enabled
+    in the identity, which meant the same offering_id had a different identity
+    after patching quantity — defeating the merge. The PUT then contained two
+    offerings sharing one offering_id, and Etsy applied the last-wins value.
     """
+    offering_id = offering.get("offering_id") or offering.get("product_offering_id")
+    if offering_id is not None:
+        return ("by_id", offering_id)
+
     sku = offering.get("sku")
     pv_raw = offering.get("property_values") or []
     pv_pairs = []
@@ -45,20 +58,79 @@ def _offering_identity_key(offering: dict[str, Any]) -> tuple:
         for vid in vids:
             pv_pairs.append((pid, vid))
     pv_sorted = tuple(sorted(pv_pairs))
+    return ("new", sku, pv_sorted)
 
-    qty = offering.get("quantity")
-    price = offering.get("price")
-    if isinstance(price, dict):
-        price_key = json.dumps(price, sort_keys=True)
-    else:
-        price_key = str(price) if price is not None else None
-    is_enabled = offering.get("is_enabled")
-    offering_id = offering.get("offering_id") or offering.get("product_offering_id")
-    return (sku, pv_sorted, qty, price_key, is_enabled, offering_id)
+
+# Per Etsy OpenAPI spec for PUT /v3/application/listings/{listing_id}/inventory.
+# Sourced from https://www.etsy.com/openapi/generated/oas/3.0.0.json (verified
+# 2026-05-08). Anything outside these sets is rejected with HTTP 400 / "Array
+# contains invalid keys".
+_PRODUCT_PUT_FIELDS: frozenset[str] = frozenset({"sku", "property_values", "offerings"})
+_OFFERING_PUT_FIELDS: frozenset[str] = frozenset(
+    {"price", "quantity", "is_enabled", "readiness_state_id"}
+)
+_PROPERTY_VALUE_PUT_FIELDS: frozenset[str] = frozenset(
+    {"property_id", "value_ids", "scale_id", "property_name", "values"}
+)
+_INVENTORY_TOP_LEVEL_PUT_FIELDS: frozenset[str] = frozenset(
+    {
+        "products",
+        "price_on_property",
+        "quantity_on_property",
+        "readiness_state_on_property",
+        "sku_on_property",
+    }
+)
+
+
+def _money_to_float(value: Any) -> Any:
+    """Convert Etsy Money dict (GET response) to float (PUT body).
+
+    GET returns `price` as `{amount, divisor, currency_code}`. PUT requires a
+    plain number. Pass plain numbers through untouched so callers that already
+    constructed PUT-shape data aren't broken.
+    """
+    if isinstance(value, dict) and "amount" in value and "divisor" in value:
+        amount = value.get("amount") or 0
+        divisor = value.get("divisor") or 1
+        if divisor == 0:
+            return float(amount)
+        return float(amount) / float(divisor)
+    return value
+
+
+def _strip_property_value(pv: dict[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in pv.items() if k in _PROPERTY_VALUE_PUT_FIELDS}
+
+
+def _strip_offering(offering: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {k: v for k, v in offering.items() if k in _OFFERING_PUT_FIELDS}
+    if "price" in out:
+        out["price"] = _money_to_float(out["price"])
+    return out
+
+
+def _strip_product(product: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {k: v for k, v in product.items() if k in _PRODUCT_PUT_FIELDS}
+    if "property_values" in out and isinstance(out["property_values"], list):
+        out["property_values"] = [_strip_property_value(pv) for pv in out["property_values"]]
+    if "offerings" in out and isinstance(out["offerings"], list):
+        out["offerings"] = [_strip_offering(off) for off in out["offerings"]]
+    return out
 
 
 def _product_identity_key(product: dict[str, Any]) -> tuple:
-    """Build a stable identity for a product based on sku + property_values."""
+    """Build a STABLE identity for a product.
+
+    Same rule as offerings: prefer Etsy's product_id when present, fall back
+    to (sku, property_values) for new products. Older versions included
+    product_id at the end of an sku+pv tuple, which split distinct products
+    that happened to share sku+pv but had different IDs.
+    """
+    product_id = product.get("product_id")
+    if product_id is not None:
+        return ("by_id", product_id)
+
     sku = product.get("sku")
     pv_raw = product.get("property_values") or []
     pv_pairs = []
@@ -68,7 +140,7 @@ def _product_identity_key(product: dict[str, Any]) -> tuple:
         for vid in vids:
             pv_pairs.append((pid, vid))
     pv_sorted = tuple(sorted(pv_pairs))
-    return (sku, pv_sorted, product.get("product_id"))
+    return ("new", sku, pv_sorted)
 
 
 class InventoryManager:
@@ -164,9 +236,22 @@ class InventoryManager:
             if key not in seen_keys:
                 merged_products.append(prod)
 
-        payload: dict[str, Any] = {"products": merged_products}
-        # Pass through top-level inventory hints if caller supplied them
-        for k in ("price_on_property", "quantity_on_property", "sku_on_property"):
+        # Strip read-only fields (product_id, offering_id, is_deleted) and
+        # convert price Money dicts to floats before PUT. Etsy's PUT schema is
+        # narrower than its GET schema; sending GET-shape data unchanged
+        # produces "Validation error: Array contains invalid keys".
+        stripped_products = [_strip_product(p) for p in merged_products]
+
+        payload: dict[str, Any] = {"products": stripped_products}
+        # Pass through top-level inventory hints if caller supplied them.
+        # Order matches the OpenAPI spec; readiness_state_on_property is also
+        # accepted but rarely set, kept consistent with the rest.
+        for k in (
+            "price_on_property",
+            "quantity_on_property",
+            "readiness_state_on_property",
+            "sku_on_property",
+        ):
             if k in inventory:
                 payload[k] = inventory[k]
             elif k in current:
