@@ -192,7 +192,7 @@ class EtsyClient:
 
         headers = {
             "Authorization": f"Bearer {access_token}",
-            "x-api-key": self.auth.get_keystring(),
+            "x-api-key": self.auth.get_x_api_key(),
         }
         if json is not None:
             headers["Content-Type"] = "application/json"

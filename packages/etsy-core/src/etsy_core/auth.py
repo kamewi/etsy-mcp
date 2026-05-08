@@ -571,5 +571,19 @@ class EtsyAuth:
         return self._tokens.access_token
 
     def get_keystring(self) -> str:
-        """Return the app keystring (client ID) for x-api-key header."""
+        """Return the app keystring (client ID). Used as the OAuth client_id."""
+        return self.keystring
+
+    def get_x_api_key(self) -> str:
+        """Return the value Etsy expects in the `x-api-key` header.
+
+        Etsy v3 requires `<keystring>:<shared_secret>` — sending only the
+        keystring returns `403 Forbidden: Shared secret is required in
+        x-api-key header.` Verified empirically against the live API on
+        2026-05-08. If `shared_secret` is unset (rare; only for read-only
+        public-data flows), fall back to keystring alone so the call at
+        least produces a clear 403 instead of a None-concat crash.
+        """
+        if self.shared_secret:
+            return f"{self.keystring}:{self.shared_secret}"
         return self.keystring
